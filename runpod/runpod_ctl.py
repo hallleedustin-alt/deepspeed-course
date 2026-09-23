@@ -138,6 +138,9 @@ EXAMPLES = {
                                          "PARTITIONS the experts across ranks; "
                                          "the routing lesson itself runs on CPU "
                                          "via `uv run moe.py`."),
+    "03_llms/12_qlora": dict(min_vram=24, gpus=1, disk=60,
+                            script="train_qlora.py",
+                            note="LoRA and QLoRA use ZeRO-2; peak VRAM is per GPU."),
     "04_video_text/01_hf_baseline": dict(min_vram=48, gpus=2, disk=120,
                    script="llava_video_trainer/video_training_script.py",
                    note="Video tokens are quadratic in frame count."),

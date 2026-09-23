@@ -50,6 +50,7 @@ TESTS=(
     tests/test_cifar10_source.py
     tests/test_moe_routing.py
     tests/test_kimi_k3_plan.py
+    tests/test_qlora.py
 )
 
 for test in "${TESTS[@]}"; do
