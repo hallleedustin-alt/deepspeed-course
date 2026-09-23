@@ -94,6 +94,20 @@ def main() -> int:
     r.check(ctl.bootstrap("01_basics/01_neuralnet", ctl.EXAMPLES["01_basics/01_neuralnet"],
                           "feature-x").count("-b feature-x") == 1,
             "bootstrap honours --branch")
+    fork_boot = ctl.bootstrap("03_llms/12_qlora", ctl.EXAMPLES["03_llms/12_qlora"],
+                              "feature/qlora-vs-lora",
+                              repo_url="https://github.com/contributor/deepspeed-course")
+    r.check("https://github.com/contributor/deepspeed-course" in fork_boot
+            and "codeload.github.com/contributor/deepspeed-course/" in fork_boot
+            and "-b feature/qlora-vs-lora" in fork_boot,
+            "a contributor fork and branch reach both clone and tarball fallback")
+    try:
+        ctl.bootstrap("03_llms/12_qlora", ctl.EXAMPLES["03_llms/12_qlora"],
+                      "main", repo_url="https://example.org/repo; echo unsafe")
+    except ValueError:
+        r.check(True, "unsafe repository override is rejected")
+    else:
+        r.check(False, "unsafe repository override is rejected")
 
     # ---- 4. Cost guard ----------------------------------------------------
     r.check(source_contains("runpod/runpod_ctl.py", "Refusing to create without --yes"),
@@ -403,6 +417,10 @@ def main() -> int:
     r.check(") &;" not in one,
             "the watchdog does not leave a bare `&` before a `;`",
             "`cmd &; next` is a bash syntax error and kills the whole command")
+    fork_syntax = subprocess.run(["bash", "-n"], input=fork_boot,
+                                  capture_output=True, text=True)
+    r.check(fork_syntax.returncode == 0,
+            "fork's pod start command parses as Bash", fork_syntax.stderr)
 
     return r.finish()
 

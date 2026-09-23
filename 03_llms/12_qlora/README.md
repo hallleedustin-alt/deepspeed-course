@@ -91,6 +91,10 @@ uv run runpod/runpod_ctl.py run 03_llms/12_qlora \
 uv run runpod/runpod_ctl.py pods
 ```
 
+While testing a contribution branch on your public fork, add
+`--repo https://github.com/YOU/deepspeed-course --branch feature/qlora-vs-lora`
+to the `run` command so the pod downloads the code you are testing.
+
 The controller's `--dry-run` imposes a wall-clock limit, including any
 first model download; it may end before any optimizer step. To measure
 both arms, use a normal run after checking the pod setup and set a suitable
