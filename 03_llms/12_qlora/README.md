@@ -195,6 +195,9 @@ confirmed local artifact is the collected log.
 After completion, the controller terminated the pod and reported zero
 pods still running.
 
+[View the full RTX 3090 comparison log](results/rtx3090_comparison.log)
+— GPU run tested at commit `11d000d`.
+
 ## Validation checks
 
 At commit `2c3efd0`:
