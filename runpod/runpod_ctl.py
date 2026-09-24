@@ -209,6 +209,8 @@ def api_key(args) -> str:
 
 def _request(url: str, key: str, method: str = "GET", payload=None, timeout: int = 60):
     data = json.dumps(payload).encode() if payload is not None else None
+    if url == GRAPHQL:
+        url += "?" + urllib.parse.urlencode({"api_key": key})
     req = urllib.request.Request(url, data=data, method=method, headers={
         "Authorization": f"Bearer {key}",
         "Content-Type": "application/json",
@@ -237,7 +239,8 @@ def _request(url: str, key: str, method: str = "GET", payload=None, timeout: int
         if exc.code in (401, 403):
             sys.exit(f"\n  RunPod rejected the credentials ({exc.code}).\n"
                      "  Check RUNPOD_API_KEY at https://console.runpod.io/user/settings\n")
-        sys.exit(f"RunPod API {exc.code} on {method} {url}\n  {detail}")
+        safe_url = url.split("?")[0]
+        sys.exit(f"RunPod API {exc.code} on {method} {safe_url}\n  {detail.replace(key, '[REDACTED]')}")
     except urllib.error.URLError as exc:
         sys.exit(f"Could not reach RunPod: {exc.reason}")
 

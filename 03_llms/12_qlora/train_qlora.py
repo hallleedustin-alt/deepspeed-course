@@ -190,6 +190,7 @@ def main():
         torch.cuda.empty_cache()
         torch.cuda.synchronize(device)
         torch.cuda.reset_peak_memory_stats(device)
+        start_allocated_bytes = torch.cuda.memory_allocated(device)
         torch.manual_seed(42)
         kwargs = dict(torch_dtype=torch.bfloat16, device_map={"": local_rank})
         if arm == "qlora":
@@ -217,6 +218,7 @@ def main():
         if (arm == "qlora") != (counts["quantized_tensors"] > 0):
             raise RuntimeError("Model representation does not match its arm.")
         loaded_bytes = torch.cuda.memory_allocated(device)
+        load_peak_bytes = torch.cuda.max_memory_allocated(device)
         engine, _, _, _ = deepspeed.initialize(
             model=model,
             model_parameters=[p for p in model.parameters() if p.requires_grad],
@@ -240,11 +242,20 @@ def main():
         results[arm] = dict(
             arm=arm, representation="nf4" if arm == "qlora" else "bf16",
             zero_stage=2, rank=rank, steps=steps,
+            start_allocated_bytes=start_allocated_bytes,
             loaded_allocated_bytes=loaded_bytes,
+            load_peak_allocated_bytes=load_peak_bytes,
             peak_allocated_bytes=torch.cuda.max_memory_allocated(device),
             first_loss=losses[0], last_loss=losses[-1],
             first_window_mean=sum(losses[:window]) / window,
             last_window_mean=sum(losses[-window:]) / window, **counts)
+        if rank == 0:
+            print(f"{arm} memory: start={start_allocated_bytes / 2**30:.2f} GiB; "
+                  f"loaded={loaded_bytes / 2**30:.2f} GiB; "
+                  f"load peak={load_peak_bytes / 2**30:.2f} GiB; "
+                  f"overall peak={results[arm]['peak_allocated_bytes'] / 2**30:.2f} GiB; "
+                  f"stored tensors={counts['stored_tensor_bytes'] / 2**30:.2f} GiB",
+                  flush=True)
         del engine, model
         gc.collect()
         torch.cuda.empty_cache()
