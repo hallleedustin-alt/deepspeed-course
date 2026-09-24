@@ -1,7 +1,7 @@
 """Compare bf16 LoRA and NF4 QLoRA memory for the same Qwen3-4B task.
 
-Both arms train the same adapters with DeepSpeed ZeRO-2. Report CUDA peaks
-per GPU, including model loading, and reset the counter between arms.
+Both arms train the same adapters with DeepSpeed ZeRO-2. Each arm runs in a
+separate process so its GPU memory measurement starts without the other model.
 """
 
 import argparse
@@ -14,8 +14,11 @@ import tempfile
 from pathlib import Path
 
 MODEL_ID = "Qwen/Qwen3-4B"
+# Apply the same LoRA adapters to these attention and feed-forward projections.
 TARGETS = ("q_proj", "k_proj", "v_proj", "o_proj",
            "gate_proj", "up_proj", "down_proj")
+# This tiny, repeated corpus checks the training pipeline and loss trend;
+# it cannot establish how either adapter performs on unseen data.
 CORPUS = (
     "A lake freezes in winter and thaws when temperatures rise.",
     "The analyst compared two memory profiles for the same training task.",
@@ -96,6 +99,8 @@ def parameter_stats(model):
     """Logical counts and stored tensor bytes, including quantization state."""
     logical = trainable = storage = quantized = 0
     for param in model.parameters():
+        # Use original tensor dimensions for a fair parameter count, even when
+        # NF4 stores the weights in a packed representation.
         n = parameter_count(param)
         logical += n
         trainable += n if param.requires_grad else 0
@@ -103,6 +108,7 @@ def parameter_stats(model):
         state = getattr(param, "quant_state", None)
         if state is not None:
             quantized += 1
+            # Count quantization scales and metadata alongside packed weights.
             for value in state.as_dict(packed=True).values():
                 if hasattr(value, "numel"):
                     storage += value.numel() * value.element_size()
@@ -130,7 +136,7 @@ def expected_adapter_count(model):
 
 
 def check_pair(lora, qlora):
-    """A plausible table from the same arm twice is an error, not a result."""
+    """Reject unequal adapters, contaminated peaks, or invalid NF4 results."""
     # Check that neither run began with substantial GPU memory already in use.
     if any(row["start_allocated_bytes"] > 256 * 2**20 for row in (lora, qlora)):
         raise ValueError("An arm started with live GPU allocations; "
@@ -182,6 +188,7 @@ def compare_isolated_arms(args):
         if rank != 0:
             return
 
+    # Compare matching GPU ranks only after both child processes have exited.
     if len(per_arm["lora"]) != len(per_arm["qlora"]):
         raise ValueError("LoRA and QLoRA returned different GPU rank counts.")
     combined = []
@@ -195,19 +202,22 @@ def compare_isolated_arms(args):
         check_loss_trend(pair["lora"])
         check_loss_trend(pair["qlora"])
         combined.append(pair)
+    # Save a comparison only if every rank passed the same scientific checks.
     Path(args.output).write_text(json.dumps(combined, indent=2) + "\n",
                                  encoding="utf-8")
     print("LoRA vs QLoRA comparison passed; saved", args.output, flush=True)
 
 
-
 def main():
     args = parse_args()
+    # The planning mode needs no GPU or heavyweight training dependencies.
     if args.plan:
         print("Qwen3-4B ~4.02B base parameters: bf16 ~8.04 GB; "
               "ideal 4-bit ~2.01 GB. These are arithmetic, NOT GPU measurements. "
               "Adapters, metadata, activations and CUDA overhead add memory.")
         return
+    # The parent starts two independent workers so the first model cannot
+    # remain allocated when measuring the second model.
     if args.arm == "both":
         compare_isolated_arms(args)
         return
@@ -219,6 +229,7 @@ def main():
     from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
     from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 
+    # Verify that both workers use the same ZeRO-2 and bf16 training settings.
     config = json.loads(Path(args.deepspeed).read_text(encoding="utf-8"))
     check_config(config)
     local_rank = int(os.environ.get("LOCAL_RANK", "0"))
@@ -226,6 +237,7 @@ def main():
     device = torch.device("cuda", local_rank)
     deepspeed.init_distributed()
     rank = torch.distributed.get_rank()
+    # Prepare the same short training examples for both arms.
     tokenizer = AutoTokenizer.from_pretrained(args.model)
     tokenizer.pad_token = tokenizer.eos_token
     examples = [tokenizer(sentence, truncation=True, max_length=64,
@@ -235,13 +247,16 @@ def main():
     results = {}
 
     for arm in (args.arm,):
-        # The parent starts a fresh process for each arm when comparing both
+        # Reset the peak counter and record any allocations before model load.
+        # The parent starts this whole worker afresh for each arm.
         gc.collect()
         torch.cuda.empty_cache()
         torch.cuda.synchronize(device)
         torch.cuda.reset_peak_memory_stats(device)
         start_allocated_bytes = torch.cuda.memory_allocated(device)
         torch.manual_seed(42)
+        # LoRA loads bf16 base weights; QLoRA loads the same model in NF4,
+        # while both arms perform calculations using bf16.
         kwargs = dict(torch_dtype=torch.bfloat16, device_map={"": local_rank})
         if arm == "qlora":
             kwargs["quantization_config"] = BitsAndBytesConfig(
@@ -250,31 +265,39 @@ def main():
                 bnb_4bit_compute_dtype=torch.bfloat16,
             )
         model = AutoModelForCausalLM.from_pretrained(args.model, **kwargs)
+        # Checkpoint activations during backpropagation to reduce memory use.
         model.config.use_cache = False
         model.gradient_checkpointing_enable()
+        # Freeze the base model in both arms so only the adapters are trained.
         if arm == "qlora":
             model = prepare_model_for_kbit_training(model)
         else:
             for param in model.parameters():
                 param.requires_grad_(False)
             model.enable_input_require_grads()
+        # The identical rank, target layers, and adapter settings keep the
+        # trainable parameter count comparable between the two arms.
         model = get_peft_model(model, LoraConfig(
             r=8, lora_alpha=16, lora_dropout=0.0, bias="none",
             target_modules=list(TARGETS), task_type="CAUSAL_LM"))
         counts = parameter_stats(model)
         counts["expected_adapter_parameters"] = expected_adapter_count(model)
+        # Fail if any extra weights became trainable or quantization was missed.
         if counts["trainable_parameters"] != counts["expected_adapter_parameters"]:
             raise RuntimeError("Unexpected trainable parameters outside adapters.")
         if (arm == "qlora") != (counts["quantized_tensors"] > 0):
             raise RuntimeError("Model representation does not match its arm.")
         loaded_bytes = torch.cuda.memory_allocated(device)
+        # A model load can briefly use more memory than the steady loaded model.
         load_peak_bytes = torch.cuda.max_memory_allocated(device)
+        # DeepSpeed trains the adapter parameters using the checked ZeRO-2 config.
         engine, _, _, _ = deepspeed.initialize(
             model=model,
             model_parameters=[p for p in model.parameters() if p.requires_grad],
             config=config)
         losses = []
         for step in range(steps):
+            # Cycle through identical examples; padding tokens do not affect loss.
             batch = examples[step % len(examples)]
             ids = batch["input_ids"].to(device)
             mask = batch["attention_mask"].to(device)
@@ -288,6 +311,7 @@ def main():
                 print(f"{arm} step {step + 1}/{steps}: "
                       f"loss {losses[-1]:.4f}", flush=True)
         torch.cuda.synchronize(device)
+        # Store per-arm evidence for the later cross-arm validation.
         window = min(5, steps)
         results[arm] = dict(
             arm=arm, representation="nf4" if arm == "qlora" else "bf16",
@@ -295,10 +319,9 @@ def main():
             start_allocated_bytes=start_allocated_bytes,
             loaded_allocated_bytes=loaded_bytes,
             load_peak_allocated_bytes=load_peak_bytes,
-            # Keep the larger peak seen during loading or training
+            # Keep the larger peak seen during loading or training.
             peak_allocated_bytes=max(
                 load_peak_bytes, torch.cuda.max_memory_allocated(device)),
-
             first_loss=losses[0], last_loss=losses[-1],
             first_window_mean=sum(losses[:window]) / window,
             last_window_mean=sum(losses[-window:]) / window, **counts)
@@ -314,6 +337,7 @@ def main():
         torch.cuda.empty_cache()
         torch.distributed.barrier()
 
+    # Collect each GPU's results and share any validation failure across ranks.
     per_rank_results = [None] * torch.distributed.get_world_size()
     torch.distributed.all_gather_object(per_rank_results, results)
     error = None
@@ -330,6 +354,7 @@ def main():
     torch.distributed.broadcast_object_list(verdict, src=0)
     if verdict[0]:
         raise ValueError(verdict[0])
+    # Only rank zero writes the JSON report; measurements remain per GPU.
     if rank == 0:
         for per_rank in per_rank_results:
             for arm, result in per_rank.items():
@@ -344,7 +369,7 @@ def main():
               "bytes count tensors and NF4 metadata. No GPU values are summed.")
         Path(args.output).write_text(
             json.dumps(per_rank_results, indent=2) + "\n", encoding="utf-8")
-    # Each comparison arm starts its own distributed group
+    # Release the distributed group before this worker exits.
     torch.distributed.destroy_process_group()
 
 
