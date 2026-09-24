@@ -70,6 +70,7 @@ def main():
                 trainable_parameters=1024, expected_adapter_parameters=1024,
                 logical_parameters=4000,
                 stored_tensor_bytes=8000, peak_allocated_bytes=12000,
+                start_allocated_bytes=0,
                 arm="lora", steps=20, first_window_mean=3.0,
                 last_window_mean=2.0)
     qlora = dict(lora, representation="nf4", quantized_tensors=2,
@@ -91,6 +92,8 @@ def main():
             "broken test: count disagrees with LoRA dimensions")
     r.check(raises(pair, lora, dict(qlora, peak_allocated_bytes=14000)),
             "broken test: increased NF4 GPU peak fails")
+    r.check(raises(pair, lora, dict(qlora, start_allocated_bytes=7 * 2**30)),
+            "broken test: old model still allocated before QLoRA fails")
     r.check(raises(trend, dict(lora, last_window_mean=3.5)),
             "broken test: rising loss fails")
     r.check(not raises(trend, dict(lora, steps=1)),

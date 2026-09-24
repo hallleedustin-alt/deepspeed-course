@@ -8,7 +8,9 @@ import argparse
 import gc
 import json
 import os
+import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 MODEL_ID = "Qwen/Qwen3-4B"
@@ -129,6 +131,10 @@ def expected_adapter_count(model):
 
 def check_pair(lora, qlora):
     """A plausible table from the same arm twice is an error, not a result."""
+    # Check that neither run began with substantial GPU memory already in use.
+    if any(row["start_allocated_bytes"] > 256 * 2**20 for row in (lora, qlora)):
+        raise ValueError("An arm started with live GPU allocations; "
+                         "the peak comparison is not isolated.")
     if lora["representation"] != "bf16" or qlora["representation"] != "nf4":
         raise ValueError("The two arms must use different representations.")
     if lora["quantized_tensors"] or not qlora["quantized_tensors"]:
@@ -154,6 +160,46 @@ def check_loss_trend(result):
         raise ValueError(f"{result['arm']} loss did not decrease over the "
                          "five-step windows; investigate the training run.")
 
+def compare_isolated_arms(args):
+    """Train each arm in a fresh worker so the first model cannot skew VRAM."""
+    rank = int(os.environ.get("RANK", "0"))
+    # Each DeepSpeed worker starts both children in order. The child inherits
+    # RANK/WORLD_SIZE and joins the same ranks for its own training session.
+    with tempfile.TemporaryDirectory(prefix="qlora-comparison-") as folder:
+        per_arm = {}
+        for arm in ("lora", "qlora"):
+            output = Path(folder) / f"{arm}.json"
+            command = [sys.executable, str(Path(__file__).resolve()),
+                       "--arm", arm, "--model", args.model,
+                       "--deepspeed", args.deepspeed,
+                       "--max-steps", str(args.max_steps),
+                       "--output", str(output)]
+            # A new process releases all live CUDA tensors when it exits.
+            subprocess.run(command, check=True)
+            if rank == 0:
+                per_arm[arm] = json.loads(output.read_text(encoding="utf-8"))
+
+        if rank != 0:
+            return
+
+    if len(per_arm["lora"]) != len(per_arm["qlora"]):
+        raise ValueError("LoRA and QLoRA returned different GPU rank counts.")
+    combined = []
+    for lora, qlora in zip(per_arm["lora"], per_arm["qlora"]):
+        pair = {"lora": lora["lora"], "qlora": qlora["qlora"]}
+        if pair["lora"]["rank"] != pair["qlora"]["rank"]:
+            raise ValueError("LoRA and QLoRA GPU ranks do not match.")
+        # Keep the original scientific checks: comparable adapters, smaller
+        # NF4 storage and peak VRAM, and falling loss for both arms.
+        check_pair(pair["lora"], pair["qlora"])
+        check_loss_trend(pair["lora"])
+        check_loss_trend(pair["qlora"])
+        combined.append(pair)
+    Path(args.output).write_text(json.dumps(combined, indent=2) + "\n",
+                                 encoding="utf-8")
+    print("LoRA vs QLoRA comparison passed; saved", args.output, flush=True)
+
+
 
 def main():
     args = parse_args()
@@ -161,6 +207,9 @@ def main():
         print("Qwen3-4B ~4.02B base parameters: bf16 ~8.04 GB; "
               "ideal 4-bit ~2.01 GB. These are arithmetic, NOT GPU measurements. "
               "Adapters, metadata, activations and CUDA overhead add memory.")
+        return
+    if args.arm == "both":
+        compare_isolated_arms(args)
         return
     require_gpu()
     import torch
@@ -185,7 +234,8 @@ def main():
     steps = 40 if args.max_steps == -1 else args.max_steps
     results = {}
 
-    for arm in (("lora", "qlora") if args.arm == "both" else (args.arm,)):
+    for arm in (args.arm,):
+        # The parent starts a fresh process for each arm when comparing both
         gc.collect()
         torch.cuda.empty_cache()
         torch.cuda.synchronize(device)
@@ -245,7 +295,10 @@ def main():
             start_allocated_bytes=start_allocated_bytes,
             loaded_allocated_bytes=loaded_bytes,
             load_peak_allocated_bytes=load_peak_bytes,
-            peak_allocated_bytes=torch.cuda.max_memory_allocated(device),
+            # Keep the larger peak seen during loading or training
+            peak_allocated_bytes=max(
+                load_peak_bytes, torch.cuda.max_memory_allocated(device)),
+
             first_loss=losses[0], last_loss=losses[-1],
             first_window_mean=sum(losses[:window]) / window,
             last_window_mean=sum(losses[-window:]) / window, **counts)
@@ -291,6 +344,8 @@ def main():
               "bytes count tensors and NF4 metadata. No GPU values are summed.")
         Path(args.output).write_text(
             json.dumps(per_rank_results, indent=2) + "\n", encoding="utf-8")
+    # Each comparison arm starts its own distributed group
+    torch.distributed.destroy_process_group()
 
 
 if __name__ == "__main__":
