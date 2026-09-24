@@ -194,3 +194,27 @@ confirmed local artifact is the collected log.
 
 After completion, the controller terminated the pod and reported zero
 pods still running.
+
+## Validation checks
+
+At commit `2c3efd0`:
+
+- The repository contract audit passed all 32 checks.
+- With `CUDA_VISIBLE_DEVICES=-1`, training exited with code 1,
+  displayed CPU-only alternatives, and produced no traceback.
+- The QLoRA test suite passed all 18 checks.
+
+### Deliberately broken implementation
+
+In a separate temporary checkout, the peak-memory rejection condition
+in `check_pair()` was replaced with `if False`.
+
+The suite then passed 16 of 18 checks. These two checks failed:
+
+- `broken test: increased NF4 GPU peak fails`
+- `isolated comparison rejects increased NF4 GPU peak`
+
+Restoring the original condition returned the suite to 18/18 passing.
+This demonstrates that the tests detect disabled peak-memory validation.
+The demonstration ran locally using simulated measurements; it did not
+require a GPU. The broken change was never committed.
