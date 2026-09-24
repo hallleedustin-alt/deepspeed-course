@@ -8,7 +8,9 @@ import ast
 import json
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
+from types import SimpleNamespace
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from _srcload import REPO_ROOT, Results, load_function  # noqa: E402
@@ -98,6 +100,51 @@ def main():
             "broken test: rising loss fails")
     r.check(not raises(trend, dict(lora, steps=1)),
             "a one-step cap makes no convergence claim")
+    # Simulate GPU workers by writing example results without starting training.
+    calls = []
+
+    def fake_run(command, check):
+        arm = command[command.index("--arm") + 1]
+        output = Path(command[command.index("--output") + 1])
+        row = dict(lora if arm == "lora" else qlora, rank=0)
+        output.write_text(json.dumps([{arm: row}]))
+        calls.append((arm, command, check))
+
+    isolated = load_function(SOURCE, "compare_isolated_arms", extra_globals={
+        "__file__": str(FOLDER / "train_qlora.py"),
+        "os": SimpleNamespace(environ={"RANK": "0"}),
+        "sys": sys, "Path": Path, "json": json,
+        "subprocess": SimpleNamespace(run=fake_run),
+        "tempfile": tempfile,
+        "check_pair": pair, "check_loss_trend": trend,
+    })
+
+    with tempfile.TemporaryDirectory() as folder:
+        output = Path(folder) / "comparison.json"
+        args = SimpleNamespace(model="example/model", deepspeed="ds_config.json",
+                               max_steps=20, output=str(output))
+        isolated(args)
+        combined = json.loads(output.read_text())
+
+        # Verify two separate worker calls and matching GPU ranks.
+        r.check([arm for arm, _, _ in calls] == ["lora", "qlora"]
+                and all(check for _, _, check in calls)
+                and calls[0][1] is not calls[1][1]
+                and combined[0]["lora"]["rank"] == combined[0]["qlora"]["rank"],
+                "both arms run separately and merge the same GPU rank")
+
+        # Introduce a bad measurement and verify the comparison rejects it.
+        def reject_bad_peak(command, check):
+            fake_run(command, check)
+            if command[command.index("--arm") + 1] == "qlora":
+                result_path = Path(command[command.index("--output") + 1])
+                bad = json.loads(result_path.read_text())
+                bad[0]["qlora"]["peak_allocated_bytes"] = 14000
+                result_path.write_text(json.dumps(bad))
+
+        isolated.__globals__["subprocess"] = SimpleNamespace(run=reject_bad_peak)
+        r.check(raises(isolated, args),
+                "isolated comparison rejects increased NF4 GPU peak")
 
     tree = ast.parse((FOLDER / "train_qlora.py").read_text())
     main_fn = next(n for n in tree.body if isinstance(n, ast.FunctionDef)
