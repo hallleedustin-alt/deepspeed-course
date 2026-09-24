@@ -28,26 +28,44 @@ CORPUS = (
 
 
 def require_gpu():
-    """Check CUDA before importing any other training libraries."""
+    """Check GPU availability and explain CPU-only options."""
+    cpu_help = (
+        "\nYou can inspect the theoretical memory plan without a GPU:\n"
+        "  uv run --no-project python "
+        "03_llms/12_qlora/train_qlora.py --plan\n"
+        "Or run the local tests:\n"
+        "  uv run tests/test_qlora.py"
+    )
+
+    if os.environ.get("ALLOW_CPU") == "1":
+        print(
+            "ALLOW_CPU=1: bypassing preflight; training still needs CUDA.",
+            file=sys.stderr,
+        )
+        return
+
+    # Respect an explicit request to hide every GPU before importing torch.
+    visible_devices = os.environ.get("CUDA_VISIBLE_DEVICES")
+    if visible_devices is not None and visible_devices.strip() in ("", "-1"):
+        raise SystemExit(
+            "No CUDA GPU is visible. This comparison requires a GPU."
+            + cpu_help
+        )
+
     try:
         import torch
     except ImportError:
-        raise SystemExit("PyTorch is missing. Run uv sync in 03_llms/12_qlora.")
-    if torch.cuda.is_available():
-        return
-    if os.environ.get("ALLOW_CPU") == "1":
-        print("ALLOW_CPU=1: bypassing preflight; training still needs CUDA.",
-              file=sys.stderr)
-        return
-    raise SystemExit(
-        "No CUDA GPU detected. This 4B memory comparison requires a GPU.\n"
-        "You can run ./tests/run_all.sh or train_qlora.py --plan on CPU.\n"
-        "From the repository root, rent and automatically shut down a pod:\n"
-        "  uv run runpod/runpod_ctl.py recommend 03_llms/12_qlora\n"
-        "  uv run runpod/runpod_ctl.py run 03_llms/12_qlora "
-        "--dry-run --collect --wait --terminate --yes\n"
-        "  uv run runpod/runpod_ctl.py pods"
-    )
+        raise SystemExit(
+            "PyTorch is missing. For GPU training, run uv sync in "
+            "03_llms/12_qlora."
+            + cpu_help
+        ) from None
+
+    if not torch.cuda.is_available():
+        raise SystemExit(
+            "No CUDA GPU detected. This comparison requires a GPU."
+            + cpu_help
+        )
 
 
 def parse_args(argv=None):
@@ -218,10 +236,10 @@ def main():
         return
     # The parent starts two independent workers so the first model cannot
     # remain allocated when measuring the second model.
+    require_gpu()
     if args.arm == "both":
         compare_isolated_arms(args)
         return
-    require_gpu()
     import torch
     if not torch.cuda.is_available():
         raise SystemExit("CUDA is required even with ALLOW_CPU=1; use --plan.")
