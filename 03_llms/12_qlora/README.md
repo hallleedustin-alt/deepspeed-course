@@ -114,18 +114,83 @@ about convergence or model quality is not warranted.
 
 ## Reading the results
 
-On rank 0, `comparison.json` holds a separate record for each GPU rank
-and arm. `peak_allocated_bytes` is CUDA allocated memory after resetting
-the peak before each arm, including weight loading; it differs from reserved
-memory and system-level VRAM. `stored_tensor_bytes` sums parameter storage,
-buffers and NF4 quantization state; it is not the same as the CUDA peak.
-`logical_parameters` recovers original NF4 shapes from `quant_state.shape`,
-because packed uint8 `numel()` would undercount. `trainable_parameters`
-counts adapters. The first/last loss and five-step window averages describe
-the tiny repeated corpus, not generalization.
+Each arm runs in a separate Python process so the first model's GPU
+allocations cannot carry over into the second measurement. The comparison
+rejects a starting allocation above 256 MiB in either arm.
 
-The harness **raises** if both arms have the same representation, adapter
-count or logical count, or if the QLoRA stored bytes / measured peak are
-not smaller on an individual GPU. A capped run is labeled as capped.
-Absolute GB values depend on card, driver, and libraries, so none are
-invented here. A GPU run is needed to validate the measurements.
+On rank 0, `comparison.json` holds results for each GPU rank and arm:
+
+- `peak_allocated_bytes`: the larger allocated-memory peak from model
+  loading or training. This differs from reserved memory and total VRAM
+  reported by system tools.
+- `stored_tensor_bytes`: parameter storage, buffers, and NF4 quantization
+  state.
+- `logical_parameters`: original parameter counts, accounting for NF4
+  packing.
+- `trainable_parameters`: adapter parameters updated during training.
+
+The comparison requires different base-weight representations, equal
+adapter and logical parameter counts, and adapter counts matching the
+expected LoRA dimensions. QLoRA must have lower stored tensor bytes and
+a lower measured peak on each GPU. For runs of at least 20 steps, both
+arms must also have a lower final five-step mean loss than their initial
+five-step mean.
+
+## Measured GPU results
+
+The RunPod run at commit `11d000d` completed successfully (`DONE rc=0`)
+and reported `LoRA vs QLoRA comparison passed`.
+
+### Run configuration
+
+- GPU: one NVIDIA GeForce RTX 3090 with 24 GB VRAM.
+- Model: `Qwen/Qwen3-4B`.
+- DeepSpeed: ZeRO-2.
+- Adapters: rank 8, with identical targets in both arms.
+- Training: 40 optimizer steps per arm on four repeated text samples.
+- Isolation: a fresh Python process for each arm.
+- Container: `runpod/pytorch:2.8.0-py3.11-cuda12.8.1-cudnn-devel-ubuntu22.04`.
+
+### Results
+
+| Measurement | LoRA (bf16) | QLoRA (NF4) |
+|---|---:|---:|
+| Starting allocated memory | 0.00 GiB | 0.00 GiB |
+| Allocated memory after model and adapter loading | 7.55 GiB | 3.28 GiB |
+| Model-loading peak | 7.55 GiB | 3.94 GiB |
+| Overall allocated-memory peak | 8.19 GiB | 3.94 GiB |
+| Stored tensor memory | 7.55 GiB | 3.26 GiB |
+| Trainable adapter parameters | 16,515,072 | 16,515,072 |
+| First-step training loss | 5.3668 | 5.9130 |
+| Final-step training loss | 0.0112 | 0.4633 |
+
+QLoRA reduced peak allocated GPU memory by approximately **4.25 GiB
+(52%)** in this run, calculated from the rounded values above.
+
+Both arms started at 0.00 GiB at the displayed precision and trained the
+same number of adapter parameters. All memory measurements are per GPU;
+one GiB is 2^30 bytes.
+
+### Interpretation and limitations
+
+These results demonstrate memory savings for this model, configuration,
+and short training task. The tiny repeated corpus and falling training
+loss do not establish answer quality, generalization, or equivalent model
+quality between the two arms.
+
+Memory usage can change with sequence length, batch size, hardware, and
+software versions.
+
+### Run evidence
+
+The controller collected the training log at:
+
+```text
+runpod/results/dsc-91e520033c2b42ebac97/03_llms/12_qlora.log
+```
+
+The log reports that `comparison.json` was saved inside the pod. The
+confirmed local artifact is the collected log.
+
+After completion, the controller terminated the pod and reported zero
+pods still running.
