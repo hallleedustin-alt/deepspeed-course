@@ -197,6 +197,9 @@ pods still running.
 
 [View the full RTX 3090 comparison log](results/rtx3090_comparison.log)
 — GPU run tested at commit `11d000d`.
+For readability, terminal color codes were removed and carriage-return
+progress updates were placed on separate lines. Warnings and measurements
+were preserved.
 
 ## Validation checks
 
